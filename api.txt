@@ -1,0 +1,5 @@
+apikey = "5795f62b-19c5-4749-b0a0-0f6740c7c5a5"
+secretkey = "49694A5D375E01505E908B198CD8AA34"
+IP = ""
+API name = "yxwang's APi"
+Permissions = "Read/Withdraw/Trade"
