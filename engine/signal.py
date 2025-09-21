@@ -40,10 +40,10 @@ def map_factor_to_target_notional(
     if not allow_short:
         s = s.clip(lower=0.0)
 
-    # Apply leverage asymmetrically
-    s_levered = s.where(s < 0, s * float(long_leverage))
-    s_levered = s_levered.where(s < 0, s_levered)  # keep same for non-negative
-    s_levered = s_levered.where(s >= 0, s * float(short_leverage))
+    # Apply leverage asymmetrically (clearer formulation)
+    s_pos = s.clip(lower=0) * float(long_leverage)
+    s_neg = s.clip(upper=0) * float(short_leverage)
+    s_levered = s_pos + s_neg
 
     target_notional = capital * s_levered.fillna(0.0)
     target_notional.name = "target_notional"
