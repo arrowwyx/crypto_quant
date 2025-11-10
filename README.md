@@ -1,6 +1,3 @@
-## TODO
-2025/11/06: 完善回测框架，以直接支持0-1突破信号型的因子（例如双均线，唐奇安通道）；完善风险控制模块，支持灵活的止损阈值设定；（可选）设置根据近期波动率灵活调整的仓位
-
 ## Crypto Multi-Factor CTA Backtest (Single-Asset)
 
 This repository contains a modular, config-driven backtesting framework for a single-asset CTA strategy. It now supports:
@@ -28,9 +25,8 @@ crypto_quant/
       pvcorr.yaml
     portfolio/
       combo_pvcorr_double_ma.yaml
-  run_single.py              # Run single-factor with a profile-based config
-  run_portfolio.py           # Run portfolio with sleeves + risk control
-  reports/                   # Outputs
+  run.py                    # Unified runner (auto-detects single vs portfolio)
+  reports/                  # Outputs
   ...
 ```
 
@@ -54,6 +50,20 @@ allow_short: false
 long_leverage: 1.0
 short_leverage: 1.0
 stop_loss_pct: 0.03
+```
+
+### Unified runner (preferred)
+- The unified runner auto-detects mode based on the config contents.
+  - If `sleeves` is present and non-empty → portfolio run
+  - Else if `factor_profile` is present → single-factor run
+
+Usage:
+```bash
+# Single-factor
+python run.py --config configs/single/pvcorr.yaml
+
+# Portfolio
+python run.py --config configs/portfolio/combo_pvcorr_double_ma.yaml
 ```
 
 ### Single-factor config
@@ -83,7 +93,7 @@ reporting:
 ```
 Run:
 ```bash
-python run_single.py --config configs/single/pvcorr.yaml
+python run.py --config configs/single/pvcorr.yaml
 ```
 
 ### Portfolio (combo) config
@@ -125,7 +135,7 @@ reporting:
 ```
 Run:
 ```bash
-python run_portfolio.py --config configs/portfolio/combo_pvcorr_double_ma.yaml
+python run.py --config configs/portfolio/combo_pvcorr_double_ma.yaml
 ```
 
 ### Risk control
@@ -139,4 +149,9 @@ python run_portfolio.py --config configs/portfolio/combo_pvcorr_double_ma.yaml
   - Plots: `pnl.png`, `net_value.png` (with buy&hold overlay)
   - `backtest.yaml` (effective config used)
   - IC metrics/plots are skipped when trade_mode is threshold
-- Set `reporting.write_results_core: true` to also dump `results_core.csv`. 
+- Set `reporting.write_results_core: true` to also dump `results_core.csv`.
+
+### Legacy cleanup
+- The old entry points and monolithic config have been removed in favor of profiles + unified runner:
+  - Removed: `config/backtest.yaml`, `main.py`, `run_single.py`, `run_portfolio.py`.
+- Use `run.py` with the configs in `configs/single/` and `configs/portfolio/` instead. 
