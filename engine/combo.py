@@ -6,6 +6,7 @@ from typing import Dict, List, Tuple, Optional
 from engine.factor_engine import compute_factors
 from engine.signal import map_factor_to_target_notional
 from engine.risk import compute_risk_scaler
+from engine.profile_loader import load_factor_profile
 from factors.registry import registry
 
 
@@ -45,8 +46,8 @@ def build_combo_targets(
     reports_dir: str,
 ) -> Tuple[pd.DatetimeIndex, Dict[str, pd.Series]]:
     """
-    Return union eval_times and dict of {factor_name: target_notional_series} after applying shared risk scaler.
-    Equal weights if combo_cfg.weights missing or empty.
+    Legacy builder kept for backward compatibility (reads from reports);
+    retained as-is so older configs continue to work.
     """
     factors: List[str] = combo_cfg.get("factors", []) or []
     weights: List[float] = combo_cfg.get("weights", []) or []
@@ -63,12 +64,11 @@ def build_combo_targets(
         else:
             weights = [w / total for w in weights]
 
-    # Shared risk scaler
-    scaler = compute_risk_scaler(
+    # Shared base risk scaler: vol_target / recent_vol (no cap)
+    base_scaler = compute_risk_scaler(
         opens=df["open"].astype(float),
         vol_lookback_days=int(risk_cfg.get("vol_lookback_days", 63)),
         vol_target_ann=float(risk_cfg.get("vol_target_ann", 0.25)),
-        max_gross_leverage=float(risk_cfg.get("max_gross_leverage", 1.0)),
         rebalance=str(risk_cfg.get("rebalance", "monthly")),
         rebalance_days=int(risk_cfg.get("rebalance_days", 30)),
     )
@@ -78,13 +78,11 @@ def build_combo_targets(
 
     for name, weight in zip(factors, weights):
         factor_fn = registry.get(name)
-        # Load per-factor params from report config if available
         report_cfg = _load_factor_config_from_report(reports_dir, name) or {}
         signals_cfg = report_cfg.get("signals", {})
         exec_cfg = report_cfg.get("execution", {})
 
         lookback = int(signals_cfg.get("lookback_minutes", global_signals_cfg.get("lookback_minutes", 720)))
-        k_minutes = int(signals_cfg.get("k_minutes", global_signals_cfg.get("k_minutes", 60)))
         mapper = signals_cfg.get("mapper", global_signals_cfg.get("mapper", "zscore"))
         zscore_window = int(signals_cfg.get("zscore_window", global_signals_cfg.get("zscore_window", 100)))
         clip_abs = float(signals_cfg.get("clip_abs_signal", global_signals_cfg.get("clip_abs_signal", 1.0)))
@@ -104,28 +102,110 @@ def build_combo_targets(
         factor_series = compute_factors(df=df, factor_fn=factor_fn, lookback_minutes=lookback, eval_times=eval_times)
 
         capital_i = float(initial_capital) * float(weight)
-        tn = map_factor_to_target_notional(
+        # Map without per-sleeve leverage to avoid double-counting; leverage enforced via risk scaler floor
+        tn_unlevered = map_factor_to_target_notional(
             factor=factor_series,
             capital=capital_i,
             mapper=mapper,
             zscore_window=zscore_window,
             clip_abs=clip_abs,
             allow_short=allow_short,
-            long_leverage=long_leverage,
-            short_leverage=short_leverage,
+            long_leverage=1.0,
+            short_leverage=1.0,
             trade_mode=trade_mode,
             entry_long_threshold=entry_long_threshold,
             entry_short_threshold=entry_short_threshold,
         )
-        # Apply risk scaler
-        tn = tn.reindex(df.index).reindex(eval_times).reindex(df.index, method=None)
-        tn = tn.reindex(df.index)  # ensure minute index
-        tn = tn * scaler
+
+        # Apply per-sleeve leverage floor: scaler = max(base_scaler, sleeve_leverage)
+        leverage_floor = max(abs(long_leverage), abs(short_leverage))
+        scaler_i = base_scaler.clip(lower=leverage_floor)
+
+        tn = tn_unlevered.reindex(df.index)
+        tn = tn * scaler_i
         tn.name = f"target_notional_{name}"
         targets[name] = tn
-
-        # Stash stop-loss for this factor (return separately via metadata? We'll let portfolio_backtester accept per-factor sl settings.)
         targets[name].attrs = {"stop_loss_pct": stop_loss_pct}
+
+    union_eval_times = union_eval_times.intersection(df.index)
+    return union_eval_times, targets
+
+
+def build_combo_targets_from_profiles(
+    df: pd.DataFrame,
+    initial_capital: float,
+    sleeves: List[Dict],
+    risk_cfg: Dict,
+) -> Tuple[pd.DatetimeIndex, Dict[str, pd.Series]]:
+    """
+    New builder: sleeves = [{ profile: name, weight: 0.5, overrides...}, ...]
+    Applies shared base risk scaler, then per-sleeve leverage floor.
+    """
+    if not sleeves:
+        raise ValueError("sleeves list is empty")
+
+    # Normalize weights
+    weights = [float(s.get("weight", 1.0)) for s in sleeves]
+    total = sum(weights)
+    weights = [w / total for w in weights] if total != 0 else [1.0 / len(sleeves)] * len(sleeves)
+
+    base_scaler = compute_risk_scaler(
+        opens=df["open"].astype(float),
+        vol_lookback_days=int(risk_cfg.get("vol_lookback_days", 63)),
+        vol_target_ann=float(risk_cfg.get("vol_target_ann", 0.25)),
+        rebalance=str(risk_cfg.get("rebalance", "monthly")),
+        rebalance_days=int(risk_cfg.get("rebalance_days", 30)),
+    )
+
+    union_eval_times = pd.DatetimeIndex([])
+    targets: Dict[str, pd.Series] = {}
+
+    for sleeve, weight in zip(sleeves, weights):
+        prof_name = sleeve["profile"]
+        prof = load_factor_profile(prof_name)
+
+        # Extract params from profile, allow overrides in sleeve
+        lookback = int(sleeve.get("lookback_minutes", prof.get("lookback_minutes", 720)))
+        mapper = sleeve.get("mapper", prof.get("mapper", "zscore"))
+        zscore_window = int(sleeve.get("zscore_window", prof.get("zscore_window", 100)))
+        clip_abs = float(sleeve.get("clip_abs_signal", prof.get("clip_abs_signal", 1.0)))
+        trade_mode = sleeve.get("trade_mode", prof.get("trade_mode", "continuous"))
+        entry_long_threshold = float(sleeve.get("entry_long_threshold", prof.get("entry_long_threshold", 0.9)))
+        entry_short_threshold = float(sleeve.get("entry_short_threshold", prof.get("entry_short_threshold", -0.9)))
+        allow_short = bool(sleeve.get("allow_short", prof.get("allow_short", True)))
+        long_leverage = float(sleeve.get("long_leverage", prof.get("long_leverage", 1.0)))
+        short_leverage = float(sleeve.get("short_leverage", prof.get("short_leverage", 1.0)))
+        rebalance_minutes = int(sleeve.get("rebalance_minutes", prof.get("rebalance_minutes", 720)))
+        stop_loss_pct = float(sleeve.get("stop_loss_pct", prof.get("stop_loss_pct", 0.0)))
+
+        eval_times = _compute_eval_times(df.index, rebalance_minutes)
+        union_eval_times = union_eval_times.union(eval_times)
+
+        factor_fn = registry.get(prof_name)
+        factor_series = compute_factors(df=df, factor_fn=factor_fn, lookback_minutes=lookback, eval_times=eval_times)
+
+        capital_i = float(initial_capital) * float(weight)
+        # Map without leverage; enforce leverage via scaler floor
+        tn_unlevered = map_factor_to_target_notional(
+            factor=factor_series,
+            capital=capital_i,
+            mapper=mapper,
+            zscore_window=zscore_window,
+            clip_abs=clip_abs,
+            allow_short=allow_short,
+            long_leverage=1.0,
+            short_leverage=1.0,
+            trade_mode=trade_mode,
+            entry_long_threshold=entry_long_threshold,
+            entry_short_threshold=entry_short_threshold,
+        )
+
+        leverage_floor = max(abs(long_leverage), abs(short_leverage))
+        scaler_i = base_scaler.clip(lower=leverage_floor)
+        tn = tn_unlevered.reindex(df.index) * scaler_i
+        tn.name = f"target_notional_{prof_name}"
+        tn.attrs = {"stop_loss_pct": stop_loss_pct}
+        targets[prof_name] = tn
 
     union_eval_times = union_eval_times.intersection(df.index)
     return union_eval_times, targets

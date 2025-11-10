@@ -3,122 +3,140 @@
 
 ## Crypto Multi-Factor CTA Backtest (Single-Asset)
 
-This repository contains a modular, config-driven backtesting framework for a single-asset, single-factor CTA strategy using 1-minute OHLCV data (OKX via CCXT). It is designed so the same factor and signal interfaces can be reused in live trading later.
+This repository contains a modular, config-driven backtesting framework for a single-asset CTA strategy. It now supports:
+- Factor profiles (single source of truth for per-factor params)
+- Separate runners for single-factor and portfolio (combo) backtests
+- Threshold/continuous trade modes, stop-loss, monthly risk control, buy&hold baseline, summaries
 
 ### Directory structure
 ```
 crypto_quant/
-  crawler.py                # CCXT data crawler (OKX example)
-  okx_BTCUSDT_1min_data.csv # Consolidated 1m OHLCV (UTC index) for quick start
-  config/
-    backtest.yaml           # Backtest configuration
   engine/
-    __init__.py
-    data_loader.py          # CSV loader, UTC index, forward-fill minute gaps
-    factor_engine.py        # Rolling factor computation (numpy window)
-    labeler.py              # Open-to-open forward return labels
-    signal.py               # Factor -> target notional mapping (zscore/sign/threshold)
-    backtester.py           # Execution simulator (rebalance, costs, equity, stop-loss)
-    metrics.py              # Rolling IC (Pearson/Spearman), IC cumsum
-    report.py               # PNG plots + CSV exports per factor
+    ...
+    profile_loader.py        # Loads factor profiles with validation
+    combo.py                 # Combo builders (profiles-based)
+    portfolio_backtester.py  # Multi-sleeve execution
+    risk.py                  # Volatility-based risk scaler
   factors/
-    registry.py             # Factor registry (name -> callable)
-    example_factors.py      # Example numpy factor: example_momo
-  main.py                   # CLI runner to execute a backtest
-  requirements.txt          # Python dependencies
-  README.md                 # This file
+    registry.py
+    example_factors.py
+    profiles/
+      pvcorr.yaml
+      double_ma.yaml
+  configs/
+    single/
+      pvcorr.yaml
+    portfolio/
+      combo_pvcorr_double_ma.yaml
+  run_single.py              # Run single-factor with a profile-based config
+  run_portfolio.py           # Run portfolio with sleeves + risk control
+  reports/                   # Outputs
+  ...
 ```
 
-### Data expectations
-- CSV should include either `open_time` (ms since epoch) or `Datetime` (parseable to UTC), and columns: `open, high, low, close, volume`.
-- Loader standardizes to UTC, sorts, de-duplicates, and (optionally) forward-fills minute gaps:
-  - OHLC forward-filled
-  - Inserted rows get `volume=0`
+### Factor profiles
+- Location: `factors/profiles/{name}.yaml`
+- Must include `factor: {name}` matching the registry name
+- Example (`factors/profiles/pvcorr.yaml`):
 
-### Config (`config/backtest.yaml`)
-- `data`:
-  - `source_csv`: path to 1-minute data
-  - `timezone`: canonical processing tz (use `UTC`)
-  - `start`, `end`: backtest window (UTC timestamps)
-  - `forward_fill`: whether to forward-fill missing minutes
-- `signals`:
-  - `factor`: factor name in registry (e.g., `example_momo`)
-  - `lookback_minutes`: rolling window size for factor inputs
-  - `k_minutes`: label horizon; return from open[t+1] to open[t+1+k]
-  - `evaluate_on_rebalance_only`: compute factor only on rebalance timestamps
-  - `mapper`: `zscore` or `sign` to normalize factor to [-1, 1]
-  - `zscore_window`: rolling window for z-score
-  - `clip_abs_signal`: clip normalized signal to [-clip, clip]
-  - `trade_mode`: `continuous` or `threshold`
-    - `continuous`: position proportional to normalized signal (asymmetric leverage applied)
-    - `threshold`: discrete entries only when normalized signal crosses thresholds
-  - `entry_long_threshold`, `entry_short_threshold`: thresholds for `threshold` mode (e.g., 0.9, -0.9)
-- `execution`:
-  - `rebalance_minutes`: fixed interval rebalancing (e.g., 720)
-  - `trade_delay_minutes`: trade at t + delay minutes (e.g., 1 → next open)
-  - `initial_capital`: starting capital in dollars
-  - `allow_short`: whether short exposure is allowed
-  - `long_leverage`, `short_leverage`: leverage multipliers
-  - `cost_bps`: combined trading cost in basis points (fees + slippage)
-  - `stop_loss_pct`: per-trade stop-loss threshold; exit at next minute open when breached
-- `reporting`:
-  - `out_dir`: base output directory (plots and CSVs)
-  - `ic_rolling_window`: rolling window for IC
-  - `plots`: choose from `rolling_ic`, `rolling_ic_cumsum`, `pnl`, `equity`
-
-### Factor API
-- Factors are pure numpy functions registered by name.
-- Signature: a function that accepts a numpy array of shape `(lookback, 5+)` with columns `[open, high, low, close, volume, ...]` and returns a single `float`.
-
-```python
-# factors/example_factors.py
-import numpy as np
-
-def example_momo(window_ohlcv: np.ndarray) -> float:
-    close = window_ohlcv[:, 3]
-    mean_close = np.mean(close)
-    return float((close[-1] / mean_close) - 1.0) if mean_close != 0 else 0.0
+```yaml
+factor: pvcorr
+lookback_minutes: 5000
+k_minutes: 720
+rebalance_minutes: 720
+mapper: percentile
+zscore_window: 100
+clip_abs_signal: 1.0
+trade_mode: threshold
+entry_long_threshold: 0.90
+entry_short_threshold: -0.90
+allow_short: false
+long_leverage: 1.0
+short_leverage: 1.0
+stop_loss_pct: 0.03
 ```
 
-### Trade modes
-- `continuous` (original):
-  - Normalize factor to `s` in [-1, 1], apply asymmetric leverage, target notional = `capital * s_levered`.
-- `threshold` (CTA-style):
-  - Normalize factor to `s` in [-1, 1] via mapper.
-  - At evaluation (rebalance) times only:
-    - If `s >= entry_long_threshold`: open/hold long at `long_leverage * capital` notional.
-    - If `s <= entry_short_threshold`: open/hold short at `short_leverage * capital` notional.
-    - Otherwise: no new instruction (hold existing position).
+### Single-factor config
+`configs/single/pvcorr.yaml`:
+```yaml
+type: single
 
-### Stop-loss
-- When a position is opened (or flips side), the entry price is recorded.
-- Each minute before applying scheduled trades, if the adverse return from entry reaches `-stop_loss_pct`, the position is closed immediately at that minute’s open (costs applied), and entry is reset.
+data:
+  source_csv: okx_BTCUSDT_1min_data.csv
+  timezone: UTC
+  start: 2020-01-01 00:00:00
+  end: 2025-01-01 00:00:00
+  forward_fill: true
 
-### Metrics and reporting
-- Rolling IC (Pearson & Spearman) and cumulative IC (cumsum of Pearson IC) saved to CSV and PNG.
-- PnL (cumulative) and net value (equity / initial capital) plots.
-- Outputs are written to `reports/{factor_name}/` and include:
-  - `rolling_ic.png`, `rolling_ic_cumsum.png`, `pnl.png`, `net_value.png`
-  - `ic_metrics.csv`, `results_core.csv`
-  - A replicate of the config `backtest.yaml` is also included
+factor_profile: pvcorr
 
-### Running a backtest
-1. Install dependencies:
+execution:
+  initial_capital: 100000
+  trade_delay_minutes: 1
+  cost_bps: 7
+
+reporting:
+  out_dir: reports
+  plots: [pnl, equity]
+  write_results_core: false
+  folder: pvcorr
+```
+Run:
 ```bash
-pip install -r requirements.txt
+python run_single.py --config configs/single/pvcorr.yaml
 ```
-2. Adjust `config/backtest.yaml` (dates, factor name, lookback, k, trade_mode, thresholds, costs, stop-loss).
-3. Run:
+
+### Portfolio (combo) config
+`configs/portfolio/combo_pvcorr_double_ma.yaml`:
+```yaml
+type: portfolio
+name: combo_pvcorr_double_ma
+
+data:
+  source_csv: okx_BTCUSDT_1min_data.csv
+  timezone: UTC
+  start: 2020-01-01 00:00:00
+  end: 2025-01-01 00:00:00
+  forward_fill: true
+
+sleeves:
+  - profile: pvcorr
+    weight: 0.5
+  - profile: double_ma
+    weight: 0.5
+
+execution:
+  initial_capital: 100000
+  trade_delay_minutes: 1
+  cost_bps: 7
+
+risk_control:
+  enabled: true
+  vol_lookback_days: 63
+  vol_target_ann: 0.8
+  rebalance: monthly
+  rebalance_days: 30
+
+reporting:
+  out_dir: reports
+  plots: [pnl, equity]
+  write_results_core: false
+  folder: combo_pvcorr_double_ma
+```
+Run:
 ```bash
-python main.py
+python run_portfolio.py --config configs/portfolio/combo_pvcorr_double_ma.yaml
 ```
-4. Inspect outputs under `reports/{factor_name}/`.
 
-### Notes on live compatibility
-- Factor, labeling, and signal interfaces are identical for live.
-- Replace the historical loader with a streaming market data adapter, and swap the backtester’s execution with a broker adapter (e.g., OKX via CCXT). The rebalance scheduling and risk constraints carry over.
+### Risk control
+- Base scaler: `target_vol / recent_vol`; computed monthly (or every N days) and forward-filled to minute bars.
+- Per-sleeve leverage floor: `scaler = max(base_scaler, sleeve_leverage)` with `sleeve_leverage = max(|long_leverage|, |short_leverage|)`.
+- Combo uses mapper with leverage=1.0 and applies scaler after mapping to avoid double counting.
 
-### Extending
-- Add new factors: implement numpy function in `factors/your_factor.py`, register in `factors/registry.py`, and reference by name in `config/backtest.yaml`.
-- Add signal mappers or constraints in `engine/signal.py`.
-- Add risk overlays (max position change, cooldowns) or alternative execution models in `engine/backtester.py`. 
+### Reporting
+- Outputs to `reports/{folder or name}/` with:
+  - `summary.json` (annual return, vol, Sharpe, max drawdown, Calmar)
+  - Plots: `pnl.png`, `net_value.png` (with buy&hold overlay)
+  - `backtest.yaml` (effective config used)
+  - IC metrics/plots are skipped when trade_mode is threshold
+- Set `reporting.write_results_core: true` to also dump `results_core.csv`. 
